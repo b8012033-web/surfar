@@ -600,7 +600,7 @@ function doLogin(){
     return d})})
   .then(function(d){
     S.token=d.data.token;S.me=d.data.student||{};
-    S.subjectIds=(d.data.subjectIds||[]).map(String);lsSet(LS_TOKEN,S.token);enterApp();
+    S.subjectIds=(d.data.subjectIds||[]).map(String);lsSet(LS_TOKEN,S.token);try{localStorage.setItem("cstk_api",S.api||API_BASE)}catch(e){}enterApp();
   }).catch(function(e){
     console.error("login error",e);
     loginErr(e.name==="AbortError"?"السيرفر مش بيرد، جرّب تاني بعد شوية":e instanceof TypeError?"مش قادر أوصل للسيرفر. اتأكد من النت، أو إن السيرفر شغال ومفعّل CORS للدومين ده":(e.message||"حصلت مشكلة"));
@@ -811,7 +811,7 @@ function goV(l){
     if(!vs.length&&!ps.length)body+='<div class="state"><h3>لا يوجد محتوى</h3><p>لسه مفيش محتوى مضاف للمحاضرة دي</p></div>';
     var chips=[chip(vs.length,"فيديو"),chip(ps.length,"ملف PDF")];if(tot)chips.push(chip(Math.round(tot/60),"دقيقة"));if(vs.length)chips.push(chip(done+"/"+vs.length,"اتشاهد"));
     view(trail(4),"المحتوى",l.name,"دي فيديوهات ومرفقات محاضرة "+esc(l.name),chips,body);
-    function go(v){location.href="player.html?lectureId="+encodeURIComponent(l.id)+"&videoId="+encodeURIComponent(v.id)}
+    function go(v){try{localStorage.setItem("cstk_api",API_BASE||"https://surfar-production.up.railway.app")}catch(e){}location.href="player.html?lectureId="+encodeURIComponent(l.id)+"&videoId="+encodeURIComponent(v.id)+"&api="+encodeURIComponent(API_BASE||"https://surfar-production.up.railway.app")}
     if($("vhero"))$("vhero").onclick=function(){go(hv)};
     q(".vi[data-vid]").forEach(function(c,i){c.onclick=function(){go(vs[i])}});
     q(".vi[data-pdf]").forEach(function(c){c.onclick=function(){if(c.getAttribute("data-pdf"))window.open(c.getAttribute("data-pdf"),"_blank")}});

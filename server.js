@@ -7075,6 +7075,105 @@ async function recordSale({ code, name, type, price, kind, by }) {
   }
 }
 
+// Secure server-to-server endpoint for Telegram Business one-hour trial codes.
+// A Telegram account can receive this trial only once. The Telegram user ID is
+// stored in Firebase, so deleting the chat or restarting the bot cannot reset it.
+app.post("/api/bot/trial", async (req, res) => {
+  let claimPath = "";
+  let claimed = false;
+  let studentCreated = false;
+  try {
+    const expected = String(process.env.BOT_TRIAL_SECRET || "");
+    const supplied = String(req.headers["x-bot-trial-secret"] || "");
+    const a = Buffer.from(expected);
+    const b = Buffer.from(supplied);
+    if (!expected || a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      return res.status(403).json({ success: false, error: "Unauthorized" });
+    }
+
+    const telegramUserId = String(req.body?.telegramUserId || "").trim();
+    if (!/^\d{1,20}$/.test(telegramUserId)) {
+      return res.status(400).json({ success: false, error: "معرف حساب تيليجرام غير صحيح" });
+    }
+    const name = String(req.body?.name || "").trim().slice(0, 100);
+    const sectionRaw = String(req.body?.section || "").trim().slice(0, 80);
+    const section = normalizeSection(sectionRaw) || sectionRaw;
+    if (name.length < 2 || section.length < 2) {
+      return res.status(400).json({ success: false, error: "الاسم والشعبة مطلوبان" });
+    }
+
+    // Atomic create-if-absent using Firebase Realtime Database ETag.
+    // The stored ID is the student's Telegram account ID, not the chat ID.
+    claimPath = `telegramTrialUsers/${telegramUserId}`;
+    const check = await fetchT(fbUrl(claimPath), {
+      method: "GET",
+      headers: { Accept: "application/json", "X-Firebase-ETag": "true" },
+      cache: "no-store"
+    }, { timeout: 12_000, retries: 1 });
+    if (!check.ok) throw new Error(`Trial claim lookup failed: ${check.status}`);
+    const existing = await check.json().catch(() => null);
+    if (existing !== null) {
+      return res.status(409).json({ success: false, error: "حساب تيليجرام استخدم التجربة بالفعل" });
+    }
+    const etag = check.headers.get("ETag");
+    if (!etag) throw new Error("Firebase did not return ETag for trial claim");
+    const claim = { status: "pending", telegramUserId, name, section, claimedAt: now() };
+    const claimResponse = await fetchT(fbUrl(claimPath), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", Accept: "application/json", "If-Match": etag },
+      body: JSON.stringify(claim)
+    }, { timeout: 15_000, retries: 0 });
+    if (claimResponse.status === 412) {
+      return res.status(409).json({ success: false, error: "حساب تيليجرام استخدم التجربة بالفعل" });
+    }
+    if (!claimResponse.ok) throw new Error(`Trial claim write failed: ${claimResponse.status}`);
+    claimed = true;
+
+    const durationMs = resolveDurationMs({ hours: 1 });
+    let code = "";
+    for (let i = 0; i < 40; i++) {
+      const candidate = randomCode9();
+      if (!(await fbGet(`students/${candidate}`))) {
+        code = candidate;
+        break;
+      }
+    }
+    if (!code) throw new Error("تعذر إنشاء كود، حاول مرة أخرى");
+
+    const record = {
+      name,
+      section: section || null,
+      type: "custom",
+      days: null,
+      durationMs,
+      maxDevices: 1,
+      devices: {},
+      bannedDevices: {},
+      active: true,
+      createdAt: now(),
+      activatedAt: null,
+      expiresAt: null,
+      createdBy: "telegram-trial",
+      telegramUserId,
+      email: null,
+      phone: null,
+      governorate: null
+    };
+    await fbSet(`students/${code}`, record);
+    studentCreated = true;
+    await fbSet(claimPath, { ...claim, status: "used", code, usedAt: now() });
+    return res.json({ success: true, code, name, section, hours: 1, trialAlreadyUsed: false });
+  } catch (e) {
+    console.error("[bot trial] create failed:", e.message);
+    if (claimed && !studentCreated && claimPath) {
+      try { await fbDelete(claimPath); } catch (cleanupError) {
+        console.warn("[bot trial] claim cleanup failed:", cleanupError.message);
+      }
+    }
+    return res.status(500).json({ success: false, error: "تعذر إنشاء كود التجربة" });
+  }
+});
+
 app.post("/api/admin/students", requireAdmin("students_create"), async (req, res) => {
   try {
     const name = String(req.body?.name || "").trim();

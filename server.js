@@ -192,8 +192,15 @@ const TEMP_DIR = path.join(DATA_DIR, "temp_files");
 try { fs.mkdirSync(MEDIA_DIR, { recursive: true }); fs.mkdirSync(TEMP_DIR, { recursive: true }); } catch {}
 const APP_VERSION = "v1.9.0-mesari";
 
-process.on("unhandledRejection", (r) => console.error("[unhandledRejection]", (r && r.stack) || r));
-process.on("uncaughtException", (e) => console.error("[uncaughtException]", (e && e.stack) || e));
+process.on("unhandledRejection", (r) => {
+  console.error("[unhandledRejection]", (r && r.stack) || r);
+});
+// An uncaught exception can leave Node.js in an undefined state. Log it and
+// exit so Railway can restart a clean process instead of serving corrupted state.
+process.on("uncaughtException", (e) => {
+  console.error("[uncaughtException] fatal:", (e && e.stack) || e);
+  process.exit(1);
+});
 
 function wrapAsync(fn) {
   return function (req, res, next) {
@@ -7075,13 +7082,10 @@ async function recordSale({ code, name, type, price, kind, by }) {
   }
 }
 
+
 // Secure server-to-server endpoint for Telegram Business one-hour trial codes.
-// A Telegram account can receive this trial only once. The Telegram user ID is
-// stored in Firebase, so deleting the chat or restarting the bot cannot reset it.
+// Configure BOT_TRIAL_SECRET on BOTH the platform and bot Railway services.
 app.post("/api/bot/trial", async (req, res) => {
-  let claimPath = "";
-  let claimed = false;
-  let studentCreated = false;
   try {
     const expected = String(process.env.BOT_TRIAL_SECRET || "");
     const supplied = String(req.headers["x-bot-trial-secret"] || "");
@@ -7090,56 +7094,22 @@ app.post("/api/bot/trial", async (req, res) => {
     if (!expected || a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
       return res.status(403).json({ success: false, error: "Unauthorized" });
     }
-
-    const telegramUserId = String(req.body?.telegramUserId || "").trim();
-    if (!/^\d{1,20}$/.test(telegramUserId)) {
-      return res.status(400).json({ success: false, error: "معرف حساب تيليجرام غير صحيح" });
-    }
     const name = String(req.body?.name || "").trim().slice(0, 100);
     const sectionRaw = String(req.body?.section || "").trim().slice(0, 80);
     const section = normalizeSection(sectionRaw) || sectionRaw;
-    if (name.length < 2 || section.length < 2) {
-      return res.status(400).json({ success: false, error: "الاسم والشعبة مطلوبان" });
+    const telegramUserId = String(req.body?.telegramUserId || "").trim().slice(0, 40);
+    if (name.length < 2 || section.length < 2 || !telegramUserId) {
+      return res.status(400).json({ success: false, error: "الاسم والشعبة ومعرف تيليجرام مطلوبون" });
     }
-
-    // Atomic create-if-absent using Firebase Realtime Database ETag.
-    // The stored ID is the student's Telegram account ID, not the chat ID.
-    claimPath = `telegramTrialUsers/${telegramUserId}`;
-    const check = await fetchT(fbUrl(claimPath), {
-      method: "GET",
-      headers: { Accept: "application/json", "X-Firebase-ETag": "true" },
-      cache: "no-store"
-    }, { timeout: 12_000, retries: 1 });
-    if (!check.ok) throw new Error(`Trial claim lookup failed: ${check.status}`);
-    const existing = await check.json().catch(() => null);
-    if (existing !== null) {
-      return res.status(409).json({ success: false, error: "حساب تيليجرام استخدم التجربة بالفعل" });
-    }
-    const etag = check.headers.get("ETag");
-    if (!etag) throw new Error("Firebase did not return ETag for trial claim");
-    const claim = { status: "pending", telegramUserId, name, section, claimedAt: now() };
-    const claimResponse = await fetchT(fbUrl(claimPath), {
-      method: "PUT",
-      headers: { "Content-Type": "application/json", Accept: "application/json", "If-Match": etag },
-      body: JSON.stringify(claim)
-    }, { timeout: 15_000, retries: 0 });
-    if (claimResponse.status === 412) {
-      return res.status(409).json({ success: false, error: "حساب تيليجرام استخدم التجربة بالفعل" });
-    }
-    if (!claimResponse.ok) throw new Error(`Trial claim write failed: ${claimResponse.status}`);
-    claimed = true;
-
+    const linkedCode = await fbGet(`botStudentLinks/${telegramUserId}`);
+    if (linkedCode && await fbGet(`students/${linkedCode}`)) return res.status(409).json({ success: false, error: "تم استخدام التجربة من قبل" });
     const durationMs = resolveDurationMs({ hours: 1 });
     let code = "";
     for (let i = 0; i < 40; i++) {
       const candidate = randomCode9();
-      if (!(await fbGet(`students/${candidate}`))) {
-        code = candidate;
-        break;
-      }
+      if (!(await fbGet(`students/${candidate}`))) { code = candidate; break; }
     }
-    if (!code) throw new Error("تعذر إنشاء كود، حاول مرة أخرى");
-
+    if (!code) return res.status(503).json({ success: false, error: "تعذر إنشاء كود، حاول مرة أخرى" });
     const record = {
       name,
       section: section || null,
@@ -7160,17 +7130,142 @@ app.post("/api/bot/trial", async (req, res) => {
       governorate: null
     };
     await fbSet(`students/${code}`, record);
-    studentCreated = true;
-    await fbSet(claimPath, { ...claim, status: "used", code, usedAt: now() });
-    return res.json({ success: true, code, name, section, hours: 1, trialAlreadyUsed: false });
+    await fbSet(`botStudentLinks/${telegramUserId}`, code);
+    return res.json({ success: true, code, name, section, hours: 1 });
   } catch (e) {
     console.error("[bot trial] create failed:", e.message);
-    if (claimed && !studentCreated && claimPath) {
-      try { await fbDelete(claimPath); } catch (cleanupError) {
-        console.warn("[bot trial] claim cleanup failed:", cleanupError.message);
+    return res.status(500).json({ success: false, error: "تعذر إنشاء كود التجربة" });
+  }
+});
+
+// Telegram bot payment approval: protected by the same shared bot secret as trial creation.
+app.post("/api/bot/payment/approve", async (req, res) => {
+  try {
+    const expected = String(process.env.BOT_TRIAL_SECRET || "");
+    const supplied = String(req.headers["x-bot-trial-secret"] || "");
+    const a = Buffer.from(expected), b = Buffer.from(supplied);
+    if (!expected || a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      return res.status(403).json({ success: false, error: "Unauthorized" });
+    }
+    const requestId = String(req.body?.requestId || "").trim();
+    const name = String(req.body?.name || "").trim().slice(0, 100);
+    const sectionRaw = String(req.body?.section || "").trim().slice(0, 80);
+    const section = normalizeSection(sectionRaw) || sectionRaw;
+    const phone = normalizePhone(req.body?.phone);
+    const telegramUserId = String(req.body?.telegramUserId || "").trim().slice(0, 40);
+    const duration = req.body?.duration || {};
+    const adminTelegramId = String(req.body?.adminTelegramId || "").trim().slice(0, 40);
+    if (!requestId || name.length < 2 || section.length < 2 || !phone || !telegramUserId || !adminTelegramId) {
+      return res.status(400).json({ success: false, error: "بيانات الطلب ناقصة" });
+    }
+
+    const priorOrder = await fbGet(`paymentOrders/${requestId}`);
+    if (priorOrder?.status === "approved" && priorOrder.code) {
+      const priorExpiry = Number(priorOrder.expiresAt) || 0;
+      return res.json({
+        success: true, code: priorOrder.code, action: priorOrder.action || "renewed",
+        expiresAt: priorExpiry, expiresAtText: priorExpiry ? new Date(priorExpiry).toLocaleString("ar-EG", { timeZone: "Africa/Cairo" }) : "",
+        durationLabel: priorOrder.durationLabel || "اشتراك", idempotent: true
+      });
+    }
+
+    let type = "custom", days = null, durationMs = 0, fixedExpiry = null, durationLabel = "";
+    if (duration.type === "month" || duration.type === "year") {
+      type = duration.type;
+      durationMs = resolveDurationMs({ type });
+      durationLabel = type === "month" ? "شهر (30 يومًا)" : "سنة (365 يومًا)";
+    } else if (duration.type === "days") {
+      days = Number(duration.days);
+      if (!Number.isInteger(days) || days < 1 || days > 3650) return res.status(400).json({ success: false, error: "عدد الأيام غير صحيح" });
+      durationMs = resolveDurationMs({ days });
+      durationLabel = `${days} يوم`;
+    } else if (duration.type === "date") {
+      const date = String(duration.date || "");
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ success: false, error: "صيغة التاريخ غير صحيحة" });
+      const end = new Date(`${date}T23:59:59+02:00`);
+      if (Number.isNaN(end.getTime()) || end.toISOString().slice(0, 10) !== date || end.getTime() <= now()) {
+        return res.status(400).json({ success: false, error: "تاريخ الانتهاء غير صالح أو مضى" });
+      }
+      fixedExpiry = end.getTime();
+      durationMs = fixedExpiry - now();
+      durationLabel = `حتى ${date}`;
+    } else {
+      return res.status(400).json({ success: false, error: "حدد مدة الاشتراك" });
+    }
+    if (!durationMs || durationMs <= 0) return res.status(400).json({ success: false, error: "مدة الاشتراك غير صالحة" });
+
+    // Reuse a linked trial/paid code first, then match the verified sender phone.
+    let existingCode = String(await fbGet(`botStudentLinks/${telegramUserId}`) || "");
+    let existing = existingCode ? await fbGet(`students/${existingCode}`) : null;
+    if (!existing) { existingCode = ""; }
+    if (!existing) {
+      const students = (await fbGet("students")) || {};
+      const phoneMatches = Object.entries(students).filter(([code, student]) =>
+        student && normalizePhone(student.phone) && normalizePhone(student.phone) === phone
+      );
+      if (phoneMatches.length > 1) return res.status(409).json({ success: false, error: "يوجد أكثر من كود مرتبط برقم الهاتف. يلزم ربط الكود الصحيح يدويًا قبل التفعيل." });
+      if (phoneMatches.length === 1) {
+        existingCode = phoneMatches[0][0]; existing = phoneMatches[0][1];
+      } else {
+        const nameSectionMatches = Object.entries(students).filter(([code, student]) =>
+          student && String(student.name || "").trim().toLowerCase() === name.toLowerCase() &&
+          String(student.section || "").trim() === section
+        );
+        if (nameSectionMatches.length > 1) return res.status(409).json({ success: false, error: "وجدنا أكثر من كود بنفس الاسم والشعبة. يلزم تحديد الكود الصحيح يدويًا قبل التجديد." });
+        if (nameSectionMatches.length === 1) {
+          existingCode = nameSectionMatches[0][0]; existing = nameSectionMatches[0][1];
+        }
       }
     }
-    return res.status(500).json({ success: false, error: "تعذر إنشاء كود التجربة" });
+
+    let code = existingCode;
+    let action = "renewed";
+    const timestamp = now();
+    if (existing && code) {
+      const oldExpiry = Number(existing.expiresAt) || 0;
+      const newExpiry = fixedExpiry || Math.max(timestamp, oldExpiry) + durationMs;
+      await fbPatch(`students/${code}`, {
+        name, section, phone, telegramUserId, active: true,
+        type, days, durationMs, activatedAt: timestamp, expiresAt: newExpiry,
+        lastRenewedAt: timestamp, lastRenewedBy: "telegram-payment"
+      });
+      action = existing.createdBy === "telegram-trial" ? "trial_activated" : "renewed";
+    } else {
+      for (let i = 0; i < 40; i++) {
+        const candidate = randomCode9();
+        if (!(await fbGet(`students/${candidate}`))) { code = candidate; break; }
+      }
+      if (!code) return res.status(503).json({ success: false, error: "تعذر إنشاء كود جديد" });
+      const expiry = fixedExpiry || timestamp + durationMs;
+      await fbSet(`students/${code}`, {
+        name, section, phone, telegramUserId, type, days, durationMs,
+        maxDevices: 1, devices: {}, bannedDevices: {}, active: true,
+        createdAt: timestamp, activatedAt: timestamp, expiresAt: expiry,
+        createdBy: "telegram-payment", email: null, governorate: null
+      });
+      action = "created";
+    }
+    await fbSet(`botStudentLinks/${telegramUserId}`, code);
+    const finalStudent = await fbGet(`students/${code}`);
+    const expiresAt = Number(finalStudent?.expiresAt) || (fixedExpiry || timestamp + durationMs);
+    const order = {
+      requestId, status: "approved", code, action, durationLabel,
+      name, section, phone, telegramUserId, adminTelegramId,
+      approvedAt: timestamp, expiresAt
+    };
+    await fbSet(`paymentOrders/${requestId}`, order);
+    try {
+      const pkg = (runtime.packages || []).find(p => p.id === type);
+      await recordSale({ code, name, type, price: pkg ? pkg.price : 0, kind: action, by: `telegram:${adminTelegramId}` });
+    } catch (e) { console.warn("[sale] telegram payment hook:", e.message); }
+    return res.json({
+      success: true, code, action, expiresAt,
+      expiresAtText: new Date(expiresAt).toLocaleString("ar-EG", { timeZone: "Africa/Cairo" }),
+      durationLabel
+    });
+  } catch (e) {
+    console.error("[bot payment approval] failed:", e.message);
+    return res.status(500).json({ success: false, error: "تعذر تفعيل الاشتراك: " + e.message });
   }
 });
 
@@ -8545,30 +8640,16 @@ if (!isVercel) {
   const server = app.listen(PORT, HOST, () => {
     console.log(`[API ${APP_VERSION}] ${HOST}:${PORT} Thanawya World · segment-decrypt ON · segment-cache ${Math.round(SEG_CACHE_MAX / 1048576)}MB`);
     console.log(`[API] bootstrap admin ready (${CONFIG.BOOTSTRAP_ADMIN.username})`);
-    // تسخين الكتالوج في الخلفية (مساري أولاً لو متاح)
-    try {
-      if (useThanawicaAsPrimary()) {
-        console.log("[API] primary source = thanawica — catalog on-demand");
-        // warm year subjects
-        thSubjectsForYear(CONFIG.DEFAULT_YEAR_ID || 27)
-          .then((list) => console.log("[thanawica] warm subjects", (list || []).length))
-          .catch((e) => console.warn("[thanawica] warm skip", e.message));
-      } else if (useMesariAsPrimary()) {
-        clearMesariCatalogCache();
-        crawlMesariFullCatalog()
-          .then((c) => console.log("[mesari-catalog] warm ok", c.stats))
-          .catch(() => console.warn("[mesari-catalog] warm skipped"));
-      } else {
-        clearTalebCatalogCache();
-        crawlTalebFullCatalog()
-          .then((c) => console.log("[catalog] warm ok", c.stats))
-          .catch(() => console.warn("[catalog] warm skipped"));
-      }
-    } catch {}
+    // Keep startup lightweight: do not crawl/warm the complete catalog here.
+    // Catalog endpoints load only the requested data on demand, reducing boot
+    // CPU, RAM and upstream requests (important on small Railway machines).
+    console.log("[API] catalog startup warm-up disabled; loading on demand");
   });
   server.keepAliveTimeout = 65_000;
   server.headersTimeout = 66_000;
-  server.requestTimeout = 0;
+  // Bound incomplete incoming requests; streaming responses remain governed by
+  // the route/response lifecycle rather than an unlimited request body timeout.
+  server.requestTimeout = 120_000;
   process.on("SIGTERM", () => {
     console.log("[API] SIGTERM — closing");
     server.close(() => process.exit(0));
